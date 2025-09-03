@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Tidy all registered tidydirs by moving old, non-whitelisted, non-underscore
+# entries into _misc/. Also PRUNE registrations whose directories no longer
+# exist (removes from ~/.tdirs_global and from the parent's .tdirs).
+#
+# Usage:
+#   tdir-tidy [-n] [-v] [-a AGE_HOURS]
+#
+#   -n   dry-run
+#   -v   verbose
+#   -a   age in hours (default 72)
+
+TDIRS_GLOBAL="${TDIRS_GLOBAL:-$HOME/.tdirs_global}"
+AGE_HOURS=72
+DRYRUN=0
+VERBOSE=0
+
+log() { echo "[$(date +'%F %T')] $*"; }
+vlog() { [[ $VERBOSE -eq 1 ]] && log "$@"; }
+
+while getopts ":nva:" opt; do
+   case "$opt" in
+   n) DRYRUN=1 ;;
+   v) VERBOSE=1 ;;
+   a) AGE_HOURS="${OPTARG}" ;;
+   *)
+      echo "usage: tdir-tidy [-n] [-v] [-a AGE_HOURS]" >&2
+      exit 2
+      ;;
+   esac
+done
+
+[[ -r "$TDIRS_GLOBAL" ]] || {
+   log "No $TDIRS_GLOBAL (nothing to do)."
+   exit 0
+}
+
+LOCK="$TDIRS_GLOBAL.lock"
+exec 9>"$LOCK"
+flock -n 9 || {
+   log "Another tdir-tidy is running (lock $LOCK)."
+   exit 0
+}
+
+# ---------- helpers ----------
+now_epoch() { date +%s; }
+last_touch_epoch() {
+   local p="$1" a m c
+   a=$(stat -Lc '%X' -- "$p" 2>/dev/null || echo 0)
+   m=$(stat -Lc '%Y' -- "$p" 2>/dev/null || echo 0)
+   c=$(stat -Lc '%Z' -- "$p" 2>/dev/null || echo 0)
+   ((a > m ? (m = a) : 0))
+   ((c > m ? (m = c) : 0))
+   printf '%s\n' "$m"
+}
+starts_with_underscore() { [[ "$1" == _* ]]; }
+
+safe_move() {
+   local src="$1" dst_dir="$2" base target ts
+   base="$(basename -- "$src")"
+   target="$dst_dir/$base"
+   if [[ -e "$target" ]]; then
+      ts="$(date +'%Y%m%d-%H%M%S')"
+      target="$dst_dir/${base}__moved_$ts"
+   fi
+   if [[ $DRYRUN -eq 1 ]]; then
+      echo "DRYRUN: mv -- '$src' '$target'"
+   else
+      mv -- "$src" "$target"
+   fi
+}
+
+should_move() {
+   # return 0 if eligible to move into _misc
+   local dir="$1" item="$2" cutoff="$3" whitelist="$4"
+   local name
+   name="$(basename -- "$item")"
+
+   case "$name" in . | .. | .tdirs | _in | _out | _misc) return 1 ;; esac
+   starts_with_underscore "$name" && return 1
+
+   # If it's a directory and whitelisted by name, keep it
+   if [[ -d "$item" && -r "$whitelist" ]]; then
+      if grep -Fxq -- "$name" "$whitelist"; then
+         return 1
+      fi
+   fi
+
+   local lt
+   lt="$(last_touch_epoch "$item")"
+   ((lt < cutoff))
+}
+
+file_remove_line_exact() {
+   # Remove a line that exactly matches $2 from file $1 (idempotent)
+   local file="$1" needle="$2"
+   if [[ ! -e "$file" ]]; then return 0; fi
+   if grep -Fxq -- "$needle" "$file"; then
+      if [[ $DRYRUN -eq 1 ]]; then
+         echo "DRYRUN: prune '$needle' from $file"
+      else
+         local tmp
+         tmp="$(mktemp)"
+         grep -Fxv -- "$needle" "$file" >"$tmp"
+         chmod --reference="$file" "$tmp" 2>/dev/null || true
+         mv -f -- "$tmp" "$file"
+      fi
+   fi
+}
+
+# ---------- load list once to avoid in-loop file edits ----------
+mapfile -t DIRS < <(sed -e 's/#.*$//' -e '/^[[:space:]]*$/d' "$TDIRS_GLOBAL")
+
+# ---------- pass 1: prune non-existent ----------
+pruned_any=0
+for dir in "${DIRS[@]}"; do
+   [[ -n "$dir" ]] || continue
+   if [[ ! -d "$dir" ]]; then
+      log "Prune: $dir (no longer exists)"
+      pruned_any=1
+      # Remove from global list
+      file_remove_line_exact "$TDIRS_GLOBAL" "$dir"
+      # Remove from parent's .tdirs (by basename) if present
+      parent="$(dirname -- "$dir")"
+      base="$(basename -- "$dir")"
+      parent_list="$parent/.tdirs"
+      if [[ -f "$parent_list" ]]; then
+         file_remove_line_exact "$parent_list" "$base"
+      fi
+   fi
+done
+
+# If we pruned, refresh DIRS for the tidy pass (avoid touching removed ones)
+if ((pruned_any == 1)); then
+   mapfile -t DIRS < <(sed -e 's/#.*$//' -e '/^[[:space:]]*$/d' "$TDIRS_GLOBAL")
+fi
+
+# ---------- pass 2: tidy existing ----------
+cutoff_epoch=$(($(now_epoch) - AGE_HOURS * 3600))
+for dir in "${DIRS[@]}"; do
+   [[ -n "$dir" ]] || continue
+   [[ -d "$dir" ]] || continue
+
+   misc="$dir/_misc"
+   whitelist="$dir/.tdirs"
+   [[ -d "$misc" ]] || { [[ $DRYRUN -eq 1 ]] && echo "DRYRUN: mkdir -p -- '$misc'" || mkdir -p -- "$misc"; }
+
+   vlog "Tidying: $dir (cutoff: ${AGE_HOURS}h ago)"
+
+   shopt -s dotglob nullglob
+   for item in "$dir"/*; do
+      [[ -e "$item" ]] || continue
+      if should_move "$dir" "$item" "$cutoff_epoch" "$whitelist"; then
+         vlog "  moving: $(basename -- "$item")"
+         safe_move "$item" "$misc"
+      else
+         vlog "  keep  : $(basename -- "$item")"
+      fi
+   done
+   shopt -u dotglob nullglob
+done
+
+if [[ $DRYRUN -eq 1 ]]; then
+   log "Dry-run complete."
+else
+   log "Tidy complete."
+fi

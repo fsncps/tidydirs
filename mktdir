@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+TDIRS_GLOBAL="${TDIRS_GLOBAL:-$HOME/.tdirs_global}"
+
+die() {
+   echo "ERROR: $*" >&2
+   exit 1
+}
+
+dest="${1:-}"
+[[ -n "$dest" ]] || die "usage: tdir-mk /path/to/newdir"
+dest="$(readlink -m -- "$dest")"
+parent="$(dirname -- "$dest")"
+base="$(basename -- "$dest")"
+
+# Structure
+mkdir -p -- "$dest"/{_in,_out,_misc}
+: >"$dest/.tdirs"
+chmod 0644 "$dest/.tdirs"
+
+# Optional: tag the dir with an xattr so eza can show '@' (see notes below)
+if command -v setfattr >/dev/null 2>&1; then
+   setfattr -n user.tidydir -v "1" -- "$dest" || true
+fi
+
+# Register in parent's .tdirs iff it exists
+added_parent=""
+parent_list="$parent/.tdirs"
+if [[ -f "$parent_list" ]]; then
+   if ! grep -Fxq -- "$base" "$parent_list"; then
+      echo "$base" >>"$parent_list"
+      added_parent="yes"
+   fi
+fi
+
+# Global index (full path)
+touch -- "$TDIRS_GLOBAL"
+chmod 0644 "$TDIRS_GLOBAL"
+added_global=""
+if ! grep -Fxq -- "$dest" "$TDIRS_GLOBAL"; then
+   echo "$dest" >>"$TDIRS_GLOBAL"
+   added_global="yes"
+fi
+
+echo "Created tidydir: $dest"
+echo "  + subdirs: _in _out _misc"
+[[ -n "$added_parent" ]] && echo "  + registered '$base' in $parent_list" || echo "  + parent .tdirs absent or already listed (no change)"
+[[ -n "$added_global" ]] && echo "  + added '$dest' to $TDIRS_GLOBAL" || echo "  + already in $TDIRS_GLOBAL (no change)"
